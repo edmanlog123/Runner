@@ -140,7 +140,19 @@ struct MapContainer: UIViewRepresentable {
         private var lastScreenPoint: CGPoint?
 
         init(route: RouteModel) { self.route = route }
-
+        
+        private func hardClearPolyline() {
+            // Remove path and unmap to kill any render cache
+            polyline.path = nil
+            polyline.map = nil
+            // Recreate a fresh polyline so future draws are clean
+            polyline = GMSPolyline()
+            polyline.strokeWidth = 5
+            polyline.strokeColor = .systemBlue
+            polyline.map = map
+            path = GMSMutablePath()
+        }
+        
         func setMode(draw: Bool, erase: Bool) {
             // lock map gestures while drawing/erasing
             map?.settings.setAllGesturesEnabled(!(draw || erase))
@@ -155,10 +167,21 @@ struct MapContainer: UIViewRepresentable {
         }
 
         func refreshPolyline(with coords: [CLLocationCoordinate2D]) {
+            if coords.count < 2 {
+                // Model has effectively no route — hard clear the visual
+                hardClearPolyline()
+                return
+            }
+            // Normal rebuild
             path = GMSMutablePath()
             coords.forEach { path.add($0) }
+            // Avoid animation artifacts/ghosts
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
             polyline.path = path
+            CATransaction.commit()
         }
+
 
         // MARK: Draw
         private func handleDraw(at p: CGPoint) {
@@ -181,15 +204,22 @@ struct MapContainer: UIViewRepresentable {
             simplifyRoute(toleranceMeters: 2.0)
         }
 
-        // MARK: Erase
+        
+        // MARK: Erase (Coordinator)
         private func handleErase(at p: CGPoint) {
             guard let map = map, let overlay = overlay else { return }
-            route.erase(around: p, projection: map.projection, radiusPx: eraseRadiusPx, in: overlay)
-            // rebuild path from remaining points
-            path = GMSMutablePath()
-            route.coords.forEach { path.add($0) }
-            polyline.path = path
+
+            route.erase(
+                around: p,
+                projection: map.projection,
+                radiusPx: eraseRadiusPx,
+                in: overlay
+            )
+
+            // One place to update the on‑screen geometry:
+            refreshPolyline(with: route.coords)   // this hard‑clears when empty
         }
+
 
         // Simple Douglas–Peucker to reduce jitter
         private func simplifyRoute(toleranceMeters: Double) {
