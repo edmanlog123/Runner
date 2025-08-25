@@ -83,8 +83,11 @@ final class RouteModel: ObservableObject {
 // MARK: - Map wrapper
 struct MapContainer: UIViewRepresentable {
     @ObservedObject var route: RouteModel
+    @Binding var runActive: Bool
+    @Binding var mapReady: Bool
     var drawMode: Bool
     var eraseMode: Bool
+    var onMapReady: (Coordinator) -> Void  // Change this to pass coordinator
 
     func makeUIView(context: Context) -> GMSMapView {
         let camera = GMSCameraPosition(latitude: 38.9072, longitude: -77.0369, zoom: 16)
@@ -93,6 +96,13 @@ struct MapContainer: UIViewRepresentable {
         map.settings.myLocationButton = true
         map.delegate = context.coordinator
         context.coordinator.map = map
+
+        // Set up callback for when map is truly ready
+        context.coordinator.onMapReady = {
+            DispatchQueue.main.async {
+                self.mapReady = true
+            }
+        }
 
         // One polyline we update in-place (fast)
         let poly = GMSPolyline()
@@ -114,13 +124,30 @@ struct MapContainer: UIViewRepresentable {
         ])
         context.coordinator.overlay = overlay
         context.coordinator.bindOverlayCallbacks()
-
+        
+        // Ensure parent captures the coordinator after the view has stabilized
+        DispatchQueue.main.async {
+            onMapReady(context.coordinator)
+            context.coordinator.didNotifyParentCoordinator = true
+        }
         return map
     }
 
     func updateUIView(_ map: GMSMapView, context: Context) {
+        // Fallback: if map is ready but parent hasn't captured the coordinator yet, do it once
+        if mapReady && !context.coordinator.didNotifyParentCoordinator {
+            DispatchQueue.main.async {
+                onMapReady(context.coordinator)
+                context.coordinator.didNotifyParentCoordinator = true
+            }
+        }
         context.coordinator.setMode(draw: drawMode, erase: eraseMode)
+        if !runActive {
         context.coordinator.refreshPolyline(with: route.coords)
+        }
+        if runActive {
+            context.coordinator.enterRunMode()
+        }
     }
 
     func makeCoordinator() -> Coordinator { Coordinator(route: route) }
@@ -132,6 +159,8 @@ struct MapContainer: UIViewRepresentable {
         var polyline: GMSPolyline!
         var path = GMSMutablePath()
         let route: RouteModel
+        var onMapReady: (() -> Void)?
+        var didNotifyParentCoordinator: Bool = false
 
         // tune these two for “ink” feel
         private let minPixelDelta: CGFloat = 4      // add point every ≥6px of finger movement
@@ -230,6 +259,22 @@ struct MapContainer: UIViewRepresentable {
             route.coords.forEach { path.add($0) }
             polyline.path = path
         }
+        
+        private var didEnterRunMode = false
+
+        func enterRunMode() {
+            guard !didEnterRunMode else { return }
+            didEnterRunMode = true
+            overlay?.mode = .none
+            // Don't clear the polyline - let the progress tracker handle it
+        }
+
+        // Add this delegate method to detect when map is truly ready
+        func mapViewDidFinishTileRendering(_ mapView: GMSMapView) {
+            print("Map tiles finished rendering - map is now ready")
+            onMapReady?()
+        }
+
     }
 }
 
@@ -239,6 +284,12 @@ private extension CGPoint {
         let dx = x - p.x, dy = y - p.y
         return dx*dx + dy*dy
     }
+}
+
+private func formatTime(_ timeInterval: TimeInterval) -> String {
+    let minutes = Int(timeInterval) / 60
+    let seconds = Int(timeInterval) % 60
+    return String(format: "%d:%02d", minutes, seconds)
 }
 
 // Douglas–Peucker (geodesic-ish using CLLocation distances)
@@ -282,71 +333,420 @@ func douglasPeucker(_ points: [CLLocationCoordinate2D], toleranceMeters: Double)
 // MARK: - UI
 struct ContentView: View {
     @StateObject private var route = RouteModel()
+    @State private var progressTracker: RunProgressTracker?
+    @StateObject private var location = LocationService()
+    @State private var runActive = false
+    @State private var mapCoordinator: MapContainer.Coordinator?  // Change this
+    @State private var mapReady = false
     @State private var draw = false
     @State private var erase = false
-
+    @State private var runDistance: Double = 0.0
+    @State private var routeProgress: Double = 0.0
+    @State private var currentPace: Double = 0.0
+    @State private var estimatedTimeToComplete: TimeInterval = 0
+    @State private var elapsedTime: TimeInterval = 0
+    @State private var currentSpeed: Double = 0.0
+    
     var body: some View {
-        ZStack(alignment: .top) {
-            MapContainer(route: route, drawMode: draw, eraseMode: erase)
-                .ignoresSafeArea()
-
-            HStack(spacing: 10) {
-                Button {
-                    draw.toggle(); if draw { erase = false }
-                } label: { Label(draw ? "Drawing…" : "Draw", systemImage: "pencil.tip") }
-                .buttonStyle(ToolbarStyle(active: draw))
-
-                Button {
-                    erase.toggle(); if erase { draw = false }
-                } label: { Label("Erase", systemImage: "scissors") }
-                .buttonStyle(ToolbarStyle(active: erase))
-
-                Button {
-                    if !route.coords.isEmpty {
-                        _ = route.coords.popLast()
-                        route.recalcDistance()
+        VStack(spacing: 0) {
+            // Map container with fixed height
+            ZStack(alignment: .top) {
+                MapContainer(
+                    route: route,
+                    runActive: $runActive,
+                    mapReady: $mapReady,
+                    drawMode: draw,
+                    eraseMode: erase,
+                    onMapReady: { coordinator in  // Update this
+                        print("Map ready callback called")
+                        self.mapCoordinator = coordinator
+                        print("Map coordinator set: \(self.mapCoordinator != nil)")
                     }
-                } label: { Label("Undo", systemImage: "arrow.uturn.left") }
-                .buttonStyle(ToolbarStyle())
-
-                Spacer()
-                Text(String(format: "Route: %.2f km", route.totalMeters/1000))
-                    .font(.headline)
-                    .padding(10)
-                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+                )
+                .clipped()
+                
+                // Top toolbar overlay
+                VStack(spacing: 10) {
+                    HStack(spacing: 10) {
+                        Button {
+                            draw.toggle(); if draw { erase = false }
+                        } label: { Label(draw ? "Drawing…" : "Draw", systemImage: "pencil.tip") }
+                            .buttonStyle(ToolbarStyle(active: draw))
+                        
+                        Button {
+                            erase.toggle(); if erase { draw = false }
+                        } label: { Label("Erase", systemImage: "scissors") }
+                            .buttonStyle(ToolbarStyle(active: erase))
+                        
+                        Button {
+                            if !route.coords.isEmpty {
+                                _ = route.coords.popLast()
+                                route.recalcDistance()
+                            }
+                        } label: { Label("Undo", systemImage: "arrow.uturn.left") }
+                            .buttonStyle(ToolbarStyle())
+                        
+                        Button {
+                            route.coords.removeAll()
+                            route.totalMeters = 0
+                            runActive = false
+                            progressTracker?.cleanup()
+                            progressTracker = nil
+                            elapsedTime = 0.0
+                            currentSpeed = 0.0
+                            currentPace = 0.0
+                            location.stop()
+                        } label: { Label("Reset", systemImage: "trash") }
+                            .buttonStyle(ToolbarStyle())
+                        
+                        Button {
+                            print("Start Run button tapped!")
+                            print("Route coords count: \(route.coords.count)")
+                            print("Map coordinator: \(mapCoordinator != nil ? "available" : "nil")")
+                            print("Map ready: \(mapReady)")
+                            
+                            guard !route.coords.isEmpty,
+                                    let coordinator = mapCoordinator,
+                                  let map = coordinator.map,
+                                  mapReady else {
+                                let reason = route.coords.isEmpty ? "No route drawn" :
+                                mapCoordinator == nil ? "Coordinator not available" :
+                                mapCoordinator?.map == nil ? "Map not available" : "Map not ready"
+                                print("Start Run failed: \(reason)")
+                                return
+                            }
+                            
+                            print("Starting run with \(route.coords.count) route points")
+                            self.runActive = true
+                            self.runDistance = 0.0
+                            self.routeProgress = 0.0
+                            self.elapsedTime = 0.0
+                            
+                            // Start timer for elapsed time
+                            Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { timer in
+                                if self.runActive {
+                                    self.elapsedTime += 1.0
+                                } else {
+                                    timer.invalidate()
+                                }
+                            }
+                            
+                            // Create the tracker with the map from coordinator
+                            let tracker = RunProgressTracker(routePoints: route.coords, mapView: map)
+                            self.progressTracker = tracker
+                            
+                            // Pipe GPS updates → tracker
+                            location.onUpdate = { [weak tracker] loc in
+                                guard let tracker = tracker,
+                                      let coord = self.mapCoordinator,
+                                      let mapView = coord.map else { return }
+                                let (runDist, routeProg) = tracker.updateProgress(with: loc, mapView: mapView)
+                                DispatchQueue.main.async {
+                                    self.runDistance = runDist
+                                    self.routeProgress = routeProg
+                                    
+                                    // Calculate pace (minutes per kilometer)
+                                    if runDist > 0 {
+                                        let elapsedTime = Date().timeIntervalSince(location.startTime ?? Date())
+                                        self.currentPace = (elapsedTime / 60) / (runDist / 1000) // min/km
+                                        
+                                        // Calculate current speed (km/h)
+                                        if elapsedTime > 0 {
+                                            self.currentSpeed = (runDist / 1000) / (elapsedTime / 3600) // km/h
+                                        }
+                                        
+                                        // Estimate time to complete
+                                        if routeProg > 0 {
+                                            let remainingDistance = (1 - routeProg) * route.totalMeters
+                                            let estimatedTime = (remainingDistance / 1000) * self.currentPace * 60 // seconds
+                                            self.estimatedTimeToComplete = estimatedTime
+                                        }
+                                        
+                                        // Auto-complete run when route is finished
+                                        if routeProg >= 1.0 {
+                                            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                                                self.runActive = false
+                                                self.progressTracker?.cleanup()
+                                                self.progressTracker = nil
+                                                location.stop()
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            print("Calling location.start()")
+                            location.start()
+                            print("Location service started")
+                        } label: {
+                            Label("Start Run", systemImage: "figure.run")
+                        }
+                        .buttonStyle(ToolbarStyle())
+                        .disabled(runActive || !mapReady)
+                        
+                        if runActive {
+                            Button {
+                                self.runActive = false
+                                self.progressTracker?.cleanup()
+                                self.progressTracker = nil
+                                self.elapsedTime = 0.0
+                                self.currentSpeed = 0.0
+                                self.currentPace = 0.0
+                                location.stop()
+                            } label: {
+                                Label("Stop Run", systemImage: "stop.fill")
+                            }
+                            .buttonStyle(ToolbarStyle(active: true))
+                        }
+                        
+                        Spacer()
+                    }
+                    .padding(.horizontal).padding(.top, 12)
+                    
+                    Spacer() // Push toolbar to top
+                }
             }
-            .padding(.horizontal).padding(.top, 12)
+            .frame(height: runActive ? UIScreen.main.bounds.height * 0.5 : UIScreen.main.bounds.height * 0.7)
+            
+            // Stats panel below the map (no longer an overlay)
+            if runActive {
+                ScrollView {
+                    VStack(spacing: 12) {
+                        // Progress bar
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack {
+                                Text("Route Progress")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                Spacer()
+                                Text(String(format: "%.1f%%", routeProgress * 100))
+                                    .font(.caption)
+                                    .foregroundColor(.orange)
+                            }
+                            ProgressView(value: routeProgress)
+                                .progressViewStyle(LinearProgressViewStyle(tint: .orange))
+                        }
+                        
+                        HStack(spacing: 20) {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Route Distance")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                Text(String(format: "%.2f km", route.totalMeters/1000))
+                                    .font(.headline)
+                                    .foregroundColor(.blue)
+                            }
+                            
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Distance Run")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                Text(String(format: "%.2f km", runDistance/1000))
+                                    .font(.headline)
+                                    .foregroundColor(.green)
+                            }
+                            
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Remaining")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                Text(String(format: "%.2f km", (route.totalMeters * (1 - routeProgress))/1000))
+                                    .font(.headline)
+                                    .foregroundColor(.orange)
+                            }
+                        }
+                        
+                        HStack(spacing: 20) {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Current Pace")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                Text(String(format: "%.1f min/km", currentPace))
+                                    .font(.headline)
+                                    .foregroundColor(.purple)
+                            }
+                            
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Average Pace")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                Text(String(format: "%.1f min/km", elapsedTime > 0 ? (elapsedTime / 60) / (runDistance / 1000) : 0))
+                                    .font(.headline)
+                                    .foregroundColor(.brown)
+                            }
+                        }
+                        
+                        HStack(spacing: 20) {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("ETA")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                Text(formatTime(estimatedTimeToComplete))
+                                    .font(.headline)
+                                    .foregroundColor(.red)
+                            }
+                            
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Current Speed")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                Text(String(format: "%.1f km/h", currentSpeed))
+                                    .font(.headline)
+                                    .foregroundColor(.teal)
+                            }
+                        }
+                        
+                        HStack(spacing: 20) {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Elapsed Time")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                Text(formatTime(elapsedTime))
+                                    .font(.headline)
+                                    .foregroundColor(.indigo)
+                            }
+                            
+                            Spacer()
+                        }
+                        
+                        if routeProgress >= 1.0 {
+                            HStack {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .foregroundColor(.green)
+                                Text("Route Completed!")
+                                    .font(.headline)
+                                    .foregroundColor(.green)
+                            }
+                            .padding(.top, 8)
+                        }
+                    }
+                    .padding(16)
+                }
+                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
+                .padding(.horizontal)
+                .padding(.bottom)
+            } else {
+                // Show only route distance when not running
+                VStack {
+                    HStack {
+                        Spacer()
+                        Text(String(format: "Route: %.2f km", route.totalMeters/1000))
+                            .font(.headline)
+                            .padding(10)
+                            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+                        Spacer()
+                    }
+                    .padding(.horizontal)
+                    .padding(.top)
+                    
+                    Spacer()
+                }
+            }
         }
     }
-}
-
-
-struct ToggleButton: View {
-    let title: String
-    let systemImage: String
-    @Binding var isOn: Bool
-    var body: some View {
-        Button {
-            isOn.toggle()
-        } label: {
-            Label(title, systemImage: systemImage)
+    
+    
+    struct ToggleButton: View {
+        let title: String
+        let systemImage: String
+        @Binding var isOn: Bool
+        var body: some View {
+            Button {
+                isOn.toggle()
+            } label: {
+                Label(title, systemImage: systemImage)
+            }
+            .buttonStyle(ToolbarStyle(active: isOn))
         }
-        .buttonStyle(ToolbarStyle(active: isOn))
     }
-}
-
-struct ToolbarStyle: ButtonStyle {
-    var active: Bool = false
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .font(.body.weight(.semibold))
-            .padding(10)
-            .background(
-                active ? AnyShapeStyle(Color.blue.opacity(0.25))
-                       : AnyShapeStyle(.ultraThinMaterial),
-                in: RoundedRectangle(cornerRadius: 12)
-            )
-
-            .scaleEffect(configuration.isPressed ? 0.98 : 1.0)
+    
+    struct ToolbarStyle: ButtonStyle {
+        var active: Bool = false
+        func makeBody(configuration: Configuration) -> some View {
+            configuration.label
+                .font(.body.weight(.semibold))
+                .padding(10)
+                .background(
+                    active ? AnyShapeStyle(Color.blue.opacity(0.25))
+                    : AnyShapeStyle(.ultraThinMaterial),
+                    in: RoundedRectangle(cornerRadius: 12)
+                )
+            
+                .scaleEffect(configuration.isPressed ? 0.98 : 1.0)
+        }
+    }
+    
+    // MARK: - Lightweight GPS service for run tracking
+    final class LocationService: NSObject, ObservableObject, CLLocationManagerDelegate {
+        private let manager = CLLocationManager()
+        var onUpdate: ((CLLocation) -> Void)?
+        var startTime: Date?
+        
+        override init() {
+            super.init()
+            manager.delegate = self
+            manager.desiredAccuracy = kCLLocationAccuracyBest
+            manager.activityType = .fitness
+            manager.distanceFilter = 3  // meters between callbacks; more frequent for better tracking
+            manager.allowsBackgroundLocationUpdates = false
+        }
+        
+        func start() {
+            let status = manager.authorizationStatus
+            print("Location authorization status: \(status.rawValue)")
+            
+            switch status {
+            case .notDetermined:
+                manager.requestWhenInUseAuthorization()
+            case .denied, .restricted:
+                print("Location access denied or restricted")
+                // Could show an alert here
+                return
+            case .authorizedWhenInUse, .authorizedAlways:
+                break
+            @unknown default:
+                break
+            }
+            
+            manager.startUpdatingLocation()
+            startTime = Date()
+            print("Started location updates")
+        }
+        
+        func stop() {
+            manager.stopUpdatingLocation()
+            startTime = nil
+        }
+        
+        // CLLocationManagerDelegate
+        func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+            guard let last = locations.last else { return }
+            print("Location updated: \(last.coordinate.latitude), \(last.coordinate.longitude)")
+            onUpdate?(last)
+        }
+        
+        func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
+            print("Location manager failed with error: \(error)")
+        }
+        
+        func locationManager(_ manager: CLLocationManager, didChangeAuthorization status: CLAuthorizationStatus) {
+            print("Location authorization changed to: \(status.rawValue)")
+            switch status {
+            case .notDetermined:
+                print("Location permission not determined")
+            case .denied:
+                print("Location permission denied")
+            case .restricted:
+                print("Location permission restricted")
+            case .authorizedWhenInUse:
+                print("Location permission granted (when in use)")
+                manager.startUpdatingLocation()
+            case .authorizedAlways:
+                print("Location permission granted (always)")
+                manager.startUpdatingLocation()
+            @unknown default:
+                print("Unknown location authorization status")
+            }
+        }
     }
 }
